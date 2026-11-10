@@ -1,0 +1,16 @@
+{
+  "extraKnownMarketplaces": {
+    "anthropic-agent-skills": {
+      "source": { "source": "github", "repo": "anthropics/skills" }
+    },
+    "addy-agent-skills": {
+      "source": { "source": "github", "repo": "addyosmani/agent-skills" }
+    }
+  },
+  "enabledPlugins": {
+    "example-skills@anthropic-agent-skills": true,
+    "superpowers@claude-plugins-official": true,
+    "agent-skills@addy-agent-skills": true,
+    "mattpocock-skills@claude-plugins-official": true
+  }
+}
