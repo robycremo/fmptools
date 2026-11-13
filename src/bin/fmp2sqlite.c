@@ -54,7 +54,9 @@ fmp_handler_status_t handle_value(int row, fmp_column_t *column, const char *val
     }
     int rc = sqlite3_bind_text(ctx->insert_stmt, column->index, value, strlen(value), SQLITE_TRANSIENT);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "Error binding parameter: %s\n", sqlite3_errmsg(ctx->db));
+        fprintf(stderr, "Error binding parameter #%d (%s) in row #%d: %s\n",
+                column->index, column->utf8_name, row, sqlite3_errmsg(ctx->db));
+        fprintf(stderr, "Bound value: %s\n", value);
         return FMP_HANDLER_ABORT;
     }
     ctx->last_row = row;
@@ -137,9 +139,15 @@ int main(int argc, char *argv[]) {
     for (int i=0; i<tables->count; i++) {
         fmp_table_t *table = &tables->tables[i];
         fmp_column_array_t *columns = fmp_list_columns(file, table, &error);
-        if (!columns) {
+        if (!columns || error != FMP_OK) {
             fprintf(stderr, "Error code: %d\n", error);
             return 1;
+        }
+        if (!columns->count) {
+            /* SQLite can't create a table without columns */
+            fprintf(stderr, "Skipping table \"%s\": no columns\n", table->utf8_name);
+            fmp_free_columns(columns);
+            continue;
         }
         size_t create_query_len = create_query_length(table, columns);
         size_t insert_query_len = insert_query_length(table, columns);
@@ -193,7 +201,12 @@ int main(int argc, char *argv[]) {
         }
 
         fmp_sqlite_ctx_t ctx = { .db = db, .table_name = table->utf8_name, .insert_stmt = stmt };
-        fmp_read_values(file, table, &handle_value, &ctx);
+        error = fmp_read_values(file, table, &handle_value, &ctx);
+        if (error != FMP_OK) {
+            /* Don't insert the row that was being bound when reading stopped */
+            fprintf(stderr, "Error code: %d\n", error);
+            return 1;
+        }
         if (ctx.last_row) {
             int rc = sqlite3_step(stmt);
             if (rc != SQLITE_DONE) {

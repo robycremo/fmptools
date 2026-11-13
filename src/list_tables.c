@@ -35,16 +35,17 @@ typedef struct fmp_list_tables_ctx_s {
 static chunk_status_t handle_chunk_list_tables_v7(fmp_chunk_t *chunk, void *ctxp) {
     fmp_list_tables_ctx_t *ctx = (fmp_list_tables_ctx_t *)ctxp;
 
-    if (path_value(chunk, chunk->path[0]) > 3)
+    if (path_value(chunk, path_at(chunk, 0)) > 3)
         return CHUNK_DONE;
 
-    if (chunk->type != FMP_CHUNK_FIELD_REF_SIMPLE)
-        return CHUNK_NEXT;
-
-    if (path_is(chunk, chunk->path[0], 3) && path_is(chunk, chunk->path[1], 16) &&
-            path_is(chunk, chunk->path[2], 5) && path_value(chunk, chunk->path[3]) >= 128) {
-        fmp_data_t *table_path = chunk->path[chunk->path_level-1];
-        size_t table_index = path_value(chunk, table_path) - 128;
+    int first = 0;
+    if (chunk->path_level >= 4 &&
+            path_is(chunk, path_at(chunk, 0), 3) && path_is(chunk, path_at(chunk, 1), 16) &&
+            path_is(chunk, path_at(chunk, 2), 5) && path_value(chunk, path_at(chunk, 3)) >= 128 &&
+            name_chunk(chunk, 4, &first)) {
+        size_t table_index = path_value(chunk, path_at(chunk, 3)) - 128;
+        if (table_index == 0 || table_index > FMP_MAX_INDEX)
+            return CHUNK_NEXT;
         fmp_table_array_t *array = ctx->array;
         if (table_index > array->count) {
             size_t old_count = array->count;
@@ -53,12 +54,8 @@ static chunk_status_t handle_chunk_list_tables_v7(fmp_chunk_t *chunk, void *ctxp
             memset(&array->tables[old_count], 0, (table_index - old_count) * sizeof(fmp_table_t));
         }
         fmp_table_t *current_table = array->tables + table_index - 1;
-        if (chunk->ref_simple == 16) {
-            convert(ctx->file->converter, ctx->file->xor_mask,
-                    current_table->utf8_name, sizeof(current_table->utf8_name),
-                    chunk->data.bytes, chunk->data.len);
-            current_table->index = table_index;
-        }
+        append_name(ctx->file, chunk, first, current_table->utf8_name, sizeof(current_table->utf8_name));
+        current_table->index = table_index;
     }
     return CHUNK_NEXT;
 }

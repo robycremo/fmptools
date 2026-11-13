@@ -85,6 +85,11 @@ fmp_error_t read_header(fmp_file_t *ctx) {
         return FMP_ERROR_BAD_MAGIC_NUMBER;
     }
 
+    if (memcmp(&buf[15], "HBAMe", 5) == 0) {
+        /* Encrypted (Encryption at Rest); the sectors are ciphertext */
+        return FMP_ERROR_ENCRYPTED_FILE;
+    }
+
     if (memcmp(&buf[15], "HBAM7", 5) == 0) {
         // or 4096
         ctx->sector_size = 4096;
@@ -186,17 +191,17 @@ int table_path_match_start1(fmp_chunk_t *chunk, int depth, int val) {
     if (table_path_depth(chunk) != depth)
         return 0;
     if (chunk->version_num < 7)
-        return path_is(chunk, chunk->path[0], val);
-    return path_value(chunk, chunk->path[0]) >= 128 && path_is(chunk, chunk->path[1], val);
+        return path_is(chunk, path_at(chunk, 0), val);
+    return path_value(chunk, path_at(chunk, 0)) >= 128 && path_is(chunk, path_at(chunk, 1), val);
 }
 
 int table_path_match_start2(fmp_chunk_t *chunk, int depth, int val1, int val2) {
     if (table_path_depth(chunk) != depth)
         return 0;
     if (chunk->version_num < 7)
-        return path_is(chunk, chunk->path[0], val1) && path_is(chunk, chunk->path[1], val2);
-    return (path_value(chunk, chunk->path[0]) >= 128 &&
-            path_is(chunk, chunk->path[1], val1) && path_is(chunk, chunk->path[2], val2));
+        return path_is(chunk, path_at(chunk, 0), val1) && path_is(chunk, path_at(chunk, 1), val2);
+    return (path_value(chunk, path_at(chunk, 0)) >= 128 &&
+            path_is(chunk, path_at(chunk, 1), val1) && path_is(chunk, path_at(chunk, 2), val2));
 }
 
 chunk_status_t process_chunk(fmp_file_t *file, fmp_chunk_t *chunk,
@@ -205,8 +210,12 @@ chunk_status_t process_chunk(fmp_file_t *file, fmp_chunk_t *chunk,
     chunk->path_level = file->path_level;
     chunk->version_num = file->version_num;
     if (chunk->type == FMP_CHUNK_PATH_POP) {
-        if (file->path_level)
-            file->path_level--;
+        if (file->path_level) {
+            /* Clear the entry so handlers that look past the current depth see nothing */
+            file->path[--file->path_level] = NULL;
+        } else {
+            // debug("*** WARNING: path level empty ***\n");
+        }
     }
     if (chunk->type == FMP_CHUNK_PATH_PUSH) {
         if (file->path_level + 1 > file->path_capacity)
@@ -219,6 +228,7 @@ chunk_status_t process_chunk(fmp_file_t *file, fmp_chunk_t *chunk,
 fmp_error_t process_chunk_chain(fmp_file_t *file, fmp_chunk_t *chunk,
         chunk_handler handle_chunk, void *user_ctx) {
     file->path_level = 0;
+    memset(file->path, 0, file->path_capacity * sizeof(fmp_data_t *));
     while (chunk) {
         chunk_status_t status = process_chunk(file, chunk, handle_chunk, user_ctx);
         if (status == CHUNK_ABORT)
@@ -227,6 +237,9 @@ fmp_error_t process_chunk_chain(fmp_file_t *file, fmp_chunk_t *chunk,
             break;
         if (status == CHUNK_NEXT)
             chunk = chunk->next;
+    }
+    if (file->path_level) {
+        // debug("*** WARNING: final path level is %d > 0 ***\n", file->path_level);
     }
     return FMP_OK;
 }
@@ -241,6 +254,54 @@ void free_chunk_chain(fmp_block_t *block) {
     block->chunk = NULL;
 }
 
+/* Blocks form a B-tree. The data we read lives in the leaves (level 0), which
+ * are chained through next_id. The chain usually starts at block 2, but in
+ * some files block 2 is an index block, so locate the leaf with no predecessor. */
+static int first_leaf_block(fmp_file_t *file) {
+    if (file->version_num < 7)
+        return 2;
+    for (size_t i = 1; i < file->num_blocks; i++) {
+        fmp_block_t *block = file->blocks[i];
+        if (block && block->level == 0 && block->prev_id == 0)
+            return i + 1;
+    }
+    return 2;
+}
+
+/* Names of tables and columns are stored either inline, as key 16 of the
+ * object's metadata node, or as a long value in sub-path [16] of that node,
+ * in segments keyed 1, 2, ... (key 0 holds formatting). node_level is the
+ * path level of the metadata node. Returns 1 if the chunk carries part of
+ * the name, and sets *first for the first part. */
+int name_chunk(fmp_chunk_t *chunk, int node_level, int *first) {
+    if (chunk->path_level == node_level) {
+        if (chunk->type == FMP_CHUNK_FIELD_REF_SIMPLE && chunk->ref_simple == 16) {
+            *first = 1;
+            return 1;
+        }
+        return 0;
+    }
+    if (chunk->path_level == node_level + 1 && path_is(chunk, path_at(chunk, node_level), 16)) {
+        if (chunk->type == FMP_CHUNK_FIELD_REF_SIMPLE && chunk->ref_simple >= 1) {
+            *first = (chunk->ref_simple == 1);
+            return 1;
+        }
+        if (chunk->type == FMP_CHUNK_DATA_SEGMENT && chunk->segment_index >= 1) {
+            *first = (chunk->segment_index == 1);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void append_name(fmp_file_t *file, fmp_chunk_t *chunk, int first, char *utf8_name, size_t size) {
+    size_t used = first ? 0 : strlen(utf8_name);
+    if (used + 1 >= size)
+        return;
+    convert(file->converter, file->xor_mask, utf8_name + used, size - used,
+            chunk->data.bytes, chunk->data.len);
+}
+
 fmp_error_t process_blocks(fmp_file_t *file,
         block_handler handle_block,
         chunk_handler handle_chunk,
@@ -252,24 +313,26 @@ fmp_error_t process_blocks(fmp_file_t *file,
     if (!handle_block || handle_block(block, user_ctx))
         process_chunk_chain(file, block->chunk, handle_chunk, user_ctx);
         */
-    int next_block = 2;
+    int next_block = first_leaf_block(file);
     int *blocks_visited = calloc(file->num_blocks, sizeof(int));
     do {
         fmp_block_t *block = file->blocks[next_block-1];
         retval = process_block(file, block);
         blocks_visited[next_block-1] = 1;
         if (retval != FMP_OK) {
-            /*
             fprintf(stderr, "ERROR processing block, reporting partial results...\n");
             block->this_id = next_block;
             if (!handle_block || handle_block(block, user_ctx))
                 process_chunk_chain(file, block->chunk, handle_chunk, user_ctx);
-                */
+            free_chunk_chain(block);
             break;
         }
         block->this_id = next_block;
         if (!handle_block || handle_block(block, user_ctx))
             retval = process_chunk_chain(file, block->chunk, handle_chunk, user_ctx);
+        /* Parse the block again on the next pass instead of keeping every
+         * chain in memory, which takes several times the file size */
+        free_chunk_chain(block);
         next_block = block->next_id;
     } while (next_block != 0 && next_block - 1 < file->num_blocks &&
             !blocks_visited[next_block-1] && retval == FMP_OK);

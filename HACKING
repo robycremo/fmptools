@@ -81,7 +81,9 @@ The header begins with a 15-byte magic number:
      00 01 00 00  00 02 00 01  00 05 00 02  00 02 C0
 
 In fmp12, the magic number is followed by the ASCII sequence "HBAM7". This
-sequence can be used to distinguish fp5 files from fmp12 files.
+sequence can be used to distinguish fp5 files from fmp12 files. Files that
+have been encrypted with FileMaker's Encryption at Rest carry "HBAMe" instead,
+and their sectors are ciphertext; these tools cannot read them.
 
 The name of the software that created the file can be found at byte offset
 541 in the header. This string is a Pascal string, consisting of a one-byte
@@ -111,10 +113,19 @@ fmp12 sector layout:
 
     Offset  Length  Value
     0       1       Deleted? 1=Yes 0=No
-    1       1       Level = Integer
     4       4       Previous Sector ID = Integer
     8       4       Next Sector ID = Integer
+    12      2       Level = Integer
+    14      2       Unknown (possibly bytes used)
     20      4076    Payload
+
+Sectors form a B-tree. The "Level" is 0 for leaf sectors, which hold the data
+described below, 1 for index sectors, whose entries map paths to the numbers
+of the sectors beneath them, and 2 for the root (the first body sector). The
+sectors of each level are chained through the Previous/Next IDs. The leaf
+chain starts at the leaf sector with a Previous ID of 0; that is usually
+sector 2, but in some files sector 2 is an index sector and the first leaf
+lies elsewhere. Index sectors are not needed to read the data.
 
 The "Payload" is a byte-code stream that can be used to construct a series
 of data chunks. For our purpoes, there are six kinds of chunks:
@@ -263,12 +274,25 @@ Simple data
     1       1+2*(C-0x10)    Value (Bytes)
 
     Offset  Length  Value
-    0       1       (0x19 | 0x23)
-    1       1       Value (Bytes)        
+    0       1       (0x18 | 0x23)
+    1       1       N = Length (Integer)
+    2       N       Value (Bytes)
+
+    Offset  Length  Value
+    0       1       0x19
+    1       1       N = Length (Integer)
+    2       N       Value (Bytes)
+    2+N     1       Trailing value (Bytes)
 
     Offset  Length          Value
     0       1               0x1A <= C <= 0x1D
-    1       2*(C-0x19)      Value (Bytes)
+    1       1               N = Length (Integer)
+    2       N               Value (Bytes)
+    2+N     2*(C-0x19)      Trailing value (Bytes)
+
+Codes 0x18 through 0x1F appear to form a family whose key is length-prefixed
+(compare the fixed three-byte keys of 0x10 through 0x17). 0x18 is the member
+with no trailing value; 0x1E and 0x1F (below) carry a length-prefixed value.
 
 
 Simple key-value
@@ -385,11 +409,24 @@ Path pop
     0       1       (0x3D | 0x40)
 
 
+Pop after chunk
+~~
+
+If the top two bits of a code byte are set (0xC0 <= C <= 0xFF), the chunk is
+decoded as if its code were (C & 0x3F), and a path pop is performed after it.
+For example, 0xE0 is a one-byte path push immediately followed by a pop, and
+0xC3 is a 0x03 key-value pair followed by a pop. These are common in index
+blocks, where each entry maps a path to a block number.
+
+
 No-op
 ~~
 
     Offset  Length  Value
-    0       1       0x80
+    0       1       (0x80 | 0x88)
+
+0x88 has been observed once, in a leaf sector; reading it as a no-op parses
+that sector to its end with a structure matching its neighbours.
 
 
 
@@ -429,12 +466,31 @@ metadata can be found at [130].[3].[5].
 The semantics are slightly changed, as documented below. fmp12 appears to
 eliminate the Integer column type in favor of all Strings.
 
-[4].[1].[7].[X]: Metadata about the Xth table
+[3].[16].[5].[128+X]: Metadata about the Xth table
 
   [16] => Table name
 
 [128+X].[3].[5].[Y]: Metadata for the Yth column of the Xth table
 
+  [16] => Column name
+
+Names that need more than plain Latin-1 text (for example Japanese names) are
+not stored inline. Instead the metadata node has a sub-path [16] holding the
+name as a long value: key 0 carries formatting and keys 1, 2, ... carry the
+text, in the same way as long field values (below).
+
 [128+X].[5].[Y]: Yth record in the Xth table (Path Integer key, String value)
+
+  Keys are column indexes. A two-byte key whose value exceeds the column count
+  addresses one repetition of a repeating field: the first byte is the column
+  index and the second byte is the repetition number, starting at 2. The first
+  repetition uses the plain column key. fmp_read_values joins the repetitions
+  of a field with the ASCII group separator (0x1D), as FileMaker does when it
+  exports them.
+
+[128+X].[5].[Y].[Z]: Long value of the Zth column of the Yth record, stored
+  as a sequence of chunks whose keys or segment indexes are ordinals. Key 0
+  holds rich-text formatting. Z can also be a (column, repetition) pair as
+  described above.
 
 Note that the sequence of tables is not necessarily compact.

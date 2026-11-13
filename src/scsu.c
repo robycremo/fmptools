@@ -66,7 +66,7 @@ static uint16_t offset_table(uint8_t x) {
 }
 
 static uint32_t extended_offset(uint8_t hbyte, uint8_t lbyte) {
-    return 10000 + 80 * ((hbyte & 0x1F) * 100 + lbyte);
+    return 0x10000 + 0x80 * (((hbyte & 0x1F) << 8) + lbyte);
 }
 
 /* Implementation of A Standard Compression Scheme for Unicode
@@ -100,13 +100,13 @@ size_t convert_scsu_to_utf8(
 
     uint8_t shift = 0;
     uint8_t unicode = 0;
+    uint16_t high_surrogate = 0; /* carried across loop iterations */
     uint8_t active_window = 0;
     uint32_t last_u = 0; // Unicode code point
     errno = 0;
     while (*inbytesleft && *outbytesleft) {
         uint8_t c = *src++; *inbytesleft -= 1;
         uint32_t u = 0; // Unicode code point
-        uint16_t high_surrogate = 0; // For UTF-16 surrogate pairs
         if (unicode) {
             if (c == UQU) {
                 if (*inbytesleft >= 2) {
@@ -127,7 +127,7 @@ size_t convert_scsu_to_utf8(
                 } else { errno = EINVAL; break; }
             } else if (c == UDX) {
                 if (*inbytesleft >= 2) {
-                    dynamic_window_offsets[active_window = ((c & 0xE0) >> 5)] =
+                    dynamic_window_offsets[active_window = ((src[0] & 0xE0) >> 5)] =
                         extended_offset(src[0], src[1]);
                     src += 2;
                     *inbytesleft -= 2;
@@ -141,7 +141,13 @@ size_t convert_scsu_to_utf8(
                 } else { errno = EINVAL; break; }
             }
         } else if (shift) {
-            u = static_window_offsets[shift - SQ0] + c;
+            /* UTS #6: for SQn, a following byte of 0x00-0x7F quotes from the
+             * static window and 0x80-0xFF quotes from the dynamic window. */
+            int sq_window = shift - SQ0;
+            if (c < 0x80)
+                u = static_window_offsets[sq_window] + c;
+            else
+                u = dynamic_window_offsets[sq_window] + (c - 0x80);
             shift = 0;
         } else if (c == SCU) {
             unicode = 1;
@@ -166,7 +172,7 @@ size_t convert_scsu_to_utf8(
             } else { errno = EINVAL; break; }
         } else if (c == SDX) {
             if (*inbytesleft >= 2) {
-                dynamic_window_offsets[active_window = ((c & 0xE0) >> 5)] =
+                dynamic_window_offsets[active_window = ((src[0] & 0xE0) >> 5)] =
                     extended_offset(src[0], src[1]);
                 src += 2;
                 *inbytesleft -= 2;
@@ -189,7 +195,7 @@ size_t convert_scsu_to_utf8(
 
         /* UTF-16 surrogate pair */
         if (u >= 0xDC00 && u <= 0xDFFF) {
-            u = (high_surrogate << 10) + (u & 0x3FF);
+            u = 0x10000 + (high_surrogate << 10) + (u & 0x3FF);
         } else if (u >= 0xD800 && u <= 0xDBFF) {
             high_surrogate = (u & 0x3FF);
             continue;

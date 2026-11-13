@@ -1,3 +1,7 @@
+/* Upper bound on table/column indexes read out of the file. Anything past
+ * this is corrupt input, not a database with that many columns. */
+#define FMP_MAX_INDEX 100000
+
 typedef enum {
     CHUNK_NEXT,
     CHUNK_DONE,
@@ -25,3 +29,15 @@ size_t convert_scsu_to_utf8(
 int table_path_match_start1(fmp_chunk_t *chunk, int depth, int val);
 int table_path_match_start2(fmp_chunk_t *chunk, int depth, int val1, int val2);
 int path_is(fmp_chunk_t *chunk, fmp_data_t *path, uint64_t value);
+
+/* Bounds-checked accessor for the chunk path. Callers used to index
+ * chunk->path[N] directly without consulting path_level, which reads
+ * uninitialized pointers out of the file's path array. */
+static inline fmp_data_t *path_at(fmp_chunk_t *chunk, long i) {
+    if (i < 0 || (size_t)i >= (size_t)chunk->path_level)
+        return (fmp_data_t *)0;
+    return chunk->path[i];
+}
+
+int name_chunk(fmp_chunk_t *chunk, int node_level, int *first);
+void append_name(fmp_file_t *file, fmp_chunk_t *chunk, int first, char *utf8_name, size_t size);
